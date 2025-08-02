@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Interactive Pond with Consistent Fish Length</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      display: block;
+    }
+    #main-canvas {
+      cursor: grab;
+      z-index: 2;
+    }
+    #background-canvas {
+      z-index: 1;
+    }
+    #fps-counter {
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        padding: 8px 12px;
+        background-color: rgba(0, 0, 0, 0.6);
+        color: white;
+        font-family: monospace;
+        font-size: 14px;
+        z-index: 100;
+        border-radius: 5px;
+        line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div id="fps-counter">
+    <div>Avg FPS: --</div>
+    <div>1% Low: --</div>
+    <div>5% Low: --</div>
+  </div>
+  <canvas id="background-canvas"></canvas>
+  <canvas id="main-canvas"></canvas>
+
+  <script src="config.js"></script>
+  <script src="utils.js"></script>
+  <script src="spatial-grid.js"></script>
+  <script src="drawing.js"></script>
+  <script src="initialization.js"></script>
+  <script src="updates.js"></script>
+
+  <script>
+    // ===================================================================================
+    // Main Setup
+    // ===================================================================================
+    const backgroundCanvas = document.getElementById('background-canvas');
+    const bgCtx = backgroundCanvas.getContext('2d');
+    const canvas = document.getElementById('main-canvas');
+    const ctx = canvas.getContext('2d');
+    const shadowCanvas = document.createElement('canvas');
+    const shadowCtx = shadowCanvas.getContext('2d');
+    let drawingContext = ctx;
+
+    // ===================================================================================
+    // Global State
+    // ===================================================================================
+    const allDrawableObjects = [];
+    const allFloatingObjects = [];
+    let objectIdCounter = 0;
+    let draggedObject = null;
+    let offsetX = 0, offsetY = 0;
+    let lastTime = 0;
+    
+    // Mouse and Feed Spawning State
+    let isMouseDown = false;
+    let feedInterval = null;
+    let lastMousePos = { x: 0, y: 0 };
+
+    // Caustics State
+    const causticImage = new Image();
+    causticImage.crossOrigin = "Anonymous";
+    let causticsBuffer = null;
+    let causticOffsetX1 = 20, causticOffsetY1 = 20;
+    let causticOffsetX2 = 0, causticOffsetY2 = 0;
+
+    if (CAUSTICS_CONFIG.enabled) {
+        causticImage.onload = () => {
+            // Create a buffer canvas that's the same size as the source image.
+            const w = causticImage.width, h = causticImage.height;
+            causticsBuffer = document.createElement('canvas');
+            const bufferCtx = causticsBuffer.getContext('2d');
+            causticsBuffer.width = w;
+            causticsBuffer.height = h;
+            bufferCtx.drawImage(causticImage, 0, 0);
+            causticOffsetX2 = w / 2;
+            causticOffsetY2 = h / 2;
+            drawBackground();
+        };
+        causticImage.src = CAUSTICS_CONFIG.imageSrc;
+    }
+
+
+    // FPS Counter State
+    const fpsDisplay = document.getElementById('fps-counter');
+    let lastFpsUpdateTime = 0;
+    const FPS_SAMPLE_PERIOD = 2000;
+    const fpsSamples = [];
+
+    // ===================================================================================
+    // Spatial Grid Initialization
+    // ===================================================================================
+    const objectGrid = new SpatialGrid(window.innerWidth, window.innerHeight, Math.max(LILYPAD_CONFIG.maxRadius, CONFIG.avoidDistance, CONFIG.attractionDistance) * 2);
+
+    // ===================================================================================
+    // Force Zone Overlay
+    // ===================================================================================
+    function drawForceOverlay(ctx) {
+        const step = 15;
+        const allFish = allDrawableObjects.filter(obj => obj.type === 'fish');
+        const allFeed = allDrawableObjects.filter(obj => obj.type === 'feed' && obj.z < 100);
+
+        for (let y = 0; y < canvas.height; y += step) {
+            for (let x = 0; x < canvas.width; x += step) {
+                let totalRepulsion = 0;
+                let totalAttraction = 0;
+                const point = { x, y };
+
+                // --- Calculate Repulsion ---
+                const wD = CONFIG.wallAvoidDistance;
+                if (point.x < wD) totalRepulsion += ((wD - point.x) / wD);
+                if (point.x > canvas.width - wD) totalRepulsion += ((point.x - (canvas.width - wD)) / wD);
+                if (point.y < wD) totalRepulsion += ((wD - point.y) / wD);
+                if (point.y > canvas.height - wD) totalRepulsion += ((point.y - (canvas.height - wD)) / wD);
+
+                const cD = CONFIG.cornerAvoidDistance;
+                const corners = [[0, 0], [canvas.width, 0], [0, canvas.height], [canvas.width, canvas.height]];
+                for (const [cx, cy] of corners) {
+                    const dist = Math.hypot(point.x - cx, point.y - cy);
+                    if (dist < cD) totalRepulsion += ((cD - dist) / cD) * 1.5;
+                }
+
+                const aD = CONFIG.avoidDistance;
+                for (const fish of allFish) {
+                    const dist = Math.hypot(point.x - fish.x, point.y - fish.y);
+                    if (dist < aD && dist > 0) totalRepulsion += ((aD - dist) / aD);
+                }
+
+                // --- Calculate Attraction ---
+                const attrD = CONFIG.attractionDistance;
+                for (const feed of allFeed) {
+                    const dist = Math.hypot(point.x - feed.x, point.y - feed.y);
+                    if (dist < attrD) {
+                        totalAttraction += ((attrD - dist) / attrD) * CONFIG.attractionStrength;
+                    }
+                }
+    
+                // --- Determine Net Force and Draw ---
+                const netForce = totalAttraction - totalRepulsion;
+                
+                if (netForce > 0.05) { // Attraction is dominant
+                    const alpha = Math.min(1.0, netForce * 0.4);
+                    ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+                    ctx.fillRect(x, y, step, step);
+                } else if (netForce < -0.05) { // Repulsion is dominant
+                    const alpha = Math.min(1.0, Math.abs(netForce) * 0.4);
+                    ctx.fillStyle = `rgba(0, 0, 0, ${alpha})`;
+                    ctx.fillRect(x, y, step, step);
+                }
+            }
+        }
+    }
+
+    // ===================================================================================
+    // Event Listeners
+    // ===================================================================================
+    canvas.addEventListener('mousedown', (e) => {
+        let foundObject = null;
+        for (let i = allFloatingObjects.length - 1; i >= 0; i--) {
+            const obj = allFloatingObjects[i];
+            if (Math.hypot(e.clientX - obj.x, e.clientY - obj.y) < obj.radius) {
+                foundObject = obj;
+                break;
+            }
+        }
+
+        if (foundObject) {
+            draggedObject = foundObject;
+            offsetX = e.clientX - draggedObject.x;
+            offsetY = e.clientY - draggedObject.y;
+            canvas.style.cursor = 'grabbing';
+
+            // Initialize properties for inertia calculation
+            draggedObject.lastDragX = e.clientX;
+            draggedObject.lastDragY = e.clientY;
+            draggedObject.dragVelX = 0;
+            draggedObject.dragVelY = 0;
+        } else {
+            isMouseDown = true;
+            lastMousePos = { x: e.clientX, y: e.clientY };
+            spawnFeedAtCursor();
+            if (feedInterval) clearInterval(feedInterval);
+            feedInterval = setInterval(spawnFeedAtCursor, FEED_CONFIG.spawnInterval);
+        }
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+        if (draggedObject) {
+            const currentX = e.clientX;
+            const currentY = e.clientY;
+
+            // Calculate velocity based on mouse movement
+            draggedObject.dragVelX = currentX - draggedObject.lastDragX;
+            draggedObject.dragVelY = currentY - draggedObject.lastDragY;
+
+            // Update position
+            draggedObject.x = currentX - offsetX;
+            draggedObject.y = currentY - offsetY;
+            draggedObject.baseX = draggedObject.x;
+            draggedObject.baseY = draggedObject.y;
+
+            // Store current position for the next event
+            draggedObject.lastDragX = currentX;
+            draggedObject.lastDragY = currentY;
+        } else if (isMouseDown) {
+            lastMousePos = { x: e.clientX, y: e.clientY };
+        }
+    });
+
+    window.addEventListener('mouseup', () => {
+        if (draggedObject) {
+            // Apply the final drag velocity for inertia
+            draggedObject.pushVx = draggedObject.dragVelX;
+            draggedObject.pushVy = draggedObject.dragVelY;
+
+            draggedObject.baseX = draggedObject.x;
+            draggedObject.baseY = draggedObject.y;
+            draggedObject = null;
+        }
+        isMouseDown = false;
+        if (feedInterval) clearInterval(feedInterval);
+        feedInterval = null;
+        canvas.style.cursor = 'grab';
+    });
+
+    // ===================================================================================
+    // Main Animation Loop
+    // ===================================================================================
+    function animate(time) {
+        const timeSeconds = time / 1000;
+        const dt = Math.min((time - lastTime) / 1000, 0.1);
+        
+        if (dt > 0) {
+            const currentFps = 1 / dt;
+            fpsSamples.push(currentFps);
+        }
+        lastTime = time;
+
+        if (time > lastFpsUpdateTime + FPS_SAMPLE_PERIOD) {
+            let avgFps = ' --';
+            let p1_low = '--';
+            let p5_low = '--';
+
+            if (fpsSamples.length > 20) { 
+                const sum = fpsSamples.reduce((a, b) => a + b, 0);
+                avgFps = (sum / fpsSamples.length).toFixed(1);
+
+                fpsSamples.sort((a, b) => a - b);
+                
+                const p1_index = Math.floor(fpsSamples.length * 0.01);
+                const p5_index = Math.floor(fpsSamples.length * 0.05);
+
+                p1_low = fpsSamples[p1_index].toFixed(1);
+                p5_low = fpsSamples[p5_index].toFixed(1);
+            }
+            
+            fpsDisplay.innerHTML = `
+                <div>Avg FPS: ${avgFps}</div>
+                <div>1% Low: ${p1_low}</div>
+                <div>5% Low: ${p5_low}</div>
+            `;
+
+            lastFpsUpdateTime = time;
+            fpsSamples.length = 0; 
+        }
+
+        // --- UPDATE LOGIC ---
+        // Update caustics offsets
+        if (CAUSTICS_CONFIG.enabled && causticImage.complete) {
+            causticOffsetX1 += CAUSTICS_CONFIG.layer1.speedX * dt;
+            causticOffsetY1 += CAUSTICS_CONFIG.layer1.speedY * dt;
+            causticOffsetX2 += CAUSTICS_CONFIG.layer2.speedX * dt;
+            causticOffsetY2 += CAUSTICS_CONFIG.layer2.speedY * dt;
+        }
+
+        objectGrid.clear();
+        allDrawableObjects.forEach(obj => objectGrid.insert(obj));
+        updateObjectPhysics(timeSeconds, dt);
+        updateFishes(dt);
+        updateFeeds(timeSeconds, dt);
+        updateRipples(time);
+        
+        if (SPARKLE_CONFIG.enabled) {
+            updateSparkles(time);
+        }
+        
+        // --- DRAWING LOGIC ---
+        // Redraw the background. It will be blue, or blue + caustics, depending on config.
+        drawBackground();
+        
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(backgroundCanvas, 0, 0);
+        
+        if (CONFIG.showForceOverlay) {
+            drawForceOverlay(ctx);
+        }
+
+        // Create a temporary array of all objects to be rendered this frame.
+        let objectsToRender = [...allDrawableObjects];
+
+        // If caustics should be rendered on the surface, add a virtual object for them.
+        if (CAUSTICS_CONFIG.renderOnSurface) {
+            objectsToRender.push({
+                id: -1, // Use a special ID to ensure stable sorting
+                type: 'caustics_surface',
+                z: CAUSTICS_CONFIG.surfaceZIndex
+            });
+        }
+
+        objectsToRender.sort((a, b) => (a.z - b.z) || (a.id - b.id));
+
+        // --- Shadow Pass ---
+        drawingContext = shadowCtx;
+        drawingContext.clearRect(0, 0, shadowCanvas.width, shadowCanvas.height);
+        for (const obj of objectsToRender) {
+            // Caustics and sparkles are light effects and do not cast shadows.
+            if (obj.type === 'caustics_surface' || obj.type === 'sparkle') {
+                continue;
+            }
+
+            const depthPercent = Math.max(0, Math.min(1, obj.z / 100));
+            const offsetY = SHADOW_CONFIG.maxOffset * depthPercent;
+            const offsetX = offsetY * SHADOW_CONFIG.xOffsetMultiplier;
+
+            drawingContext.save();
+            drawingContext.translate(obj.x + offsetX, obj.y + offsetY);
+
+            switch (obj.type) {
+                case 'fish':
+                    drawSingleFish(obj, '#000000');
+                    break;
+                case 'lilypad':
+                    drawingContext.rotate(obj.angle);
+                    drawingContext.drawImage(obj.shadowCache.canvas, -obj.shadowCache.offsetX, -obj.shadowCache.offsetY);
+                    break;
+                case 'flower':
+                    drawingContext.rotate(obj.rotation);
+                    drawingContext.drawImage(obj.shadowCache.canvas, -obj.shadowCache.offsetX, -obj.shadowCache.offsetY);
+                    break;
+                case 'feed':
+                    const scale = 0.5 + (obj.z / FEED_CONFIG.startZ) * 0.5;
+                    const currentRadius = obj.radius * scale;
+                    drawingContext.fillStyle = '#000000';
+                    drawingContext.beginPath();
+                    drawingContext.arc(0, 0, currentRadius, 0, Math.PI * 2);
+                    drawingContext.fill();
+                    break;
+                case 'ripple':
+                    const easeOutQuad = t => t * (2 - t);
+                    const easedProgress = easeOutQuad(obj.progress);
+                    const currentOpacity = obj.startOpacity * (1 - easedProgress);
+
+                    drawingContext.lineWidth = lerp(obj.startLineWidth, obj.endLineWidth, easedProgress);
+                    drawingContext.strokeStyle = `rgba(0, 0, 0, ${currentOpacity * 0.5})`;
+
+                    for (let j = 0; j < obj.numWaves; j++) {
+                        const waveProgress = Math.max(0, obj.progress * 1.2 - j * 0.2);
+                        if (waveProgress > 0 && waveProgress < 1) {
+                            const easedWaveProgress = easeOutQuad(waveProgress);
+                            const currentRadius = lerp(obj.startRadius, obj.maxRadius, easedWaveProgress);
+                            drawRippleWave(drawingContext, obj, currentRadius);
+                        }
+                    }
+                    break;
+            }
+            drawingContext.restore();
+        }
+
+        shadowCtx.globalCompositeOperation = 'source-in';
+        shadowCtx.fillStyle = SHADOW_CONFIG.color;
+        shadowCtx.fillRect(0, 0, shadowCanvas.width, shadowCanvas.height);
+        shadowCtx.globalCompositeOperation = 'source-over';
+        drawingContext = ctx;
+        drawingContext.drawImage(shadowCanvas, 0, 0);
+
+        // --- Main Render Pass ---
+        for (const obj of objectsToRender) {
+            // No need to save/restore for the caustics layer as it affects the whole canvas
+            if (obj.type === 'caustics_surface') {
+                drawCausticLayers(drawingContext);
+                continue; // Go to the next object
+            }
+
+            drawingContext.save();
+            drawingContext.translate(obj.x, obj.y); // Translate to the object's world position
+            
+            switch (obj.type) {
+                case 'fish':
+                    // Fish are now drawn simply. The z-sorting places them under the caustics layer.
+                    drawSingleFish(obj); 
+                    break;
+                case 'lilypad':
+                    drawingContext.rotate(obj.angle);
+                    drawingContext.drawImage(obj.renderCache.canvas, -obj.renderCache.offsetX, -obj.renderCache.offsetY);
+                    break;
+                case 'flower':
+                    drawingContext.rotate(obj.rotation);
+                    drawingContext.drawImage(obj.renderCache.canvas, -obj.renderCache.offsetX, -obj.renderCache.offsetY);
+                    break;
+                case 'feed':
+                    const scale = 0.5 + (obj.z / FEED_CONFIG.startZ) * 0.5;
+                    const currentRadius = obj.radius * scale;
+                    
+                    let currentColor;
+                    if (obj.z > UNDERWATER_EFFECT.WATER_SURFACE_Z) {
+                        currentColor = `rgb(${obj.baseRgb[0]}, ${obj.baseRgb[1]}, ${obj.baseRgb[2]})`;
+                    } else {
+                        const sinkPercent = 1 - (Math.max(0, obj.z) / UNDERWATER_EFFECT.WATER_SURFACE_Z);
+                        const r = Math.round(lerp(obj.baseRgb[0], obj.finalRgb[0], sinkPercent));
+                        const g = Math.round(lerp(obj.baseRgb[1], obj.finalRgb[1], sinkPercent));
+                        const b = Math.round(lerp(obj.baseRgb[2], obj.finalRgb[2], sinkPercent));
+                        currentColor = `rgb(${r},${g},${b})`;
+                    }
+                    
+                    drawingContext.fillStyle = currentColor;
+                    drawingContext.beginPath();
+                    drawingContext.arc(0, 0, currentRadius, 0, Math.PI * 2);
+                    drawingContext.fill();
+                    break;
+                case 'ripple':
+                    const easeOutQuad2 = t => t * (2 - t);
+                    const easedProgress2 = easeOutQuad2(obj.progress);
+                    const currentOpacity2 = obj.startOpacity * (1 - easedProgress2);
+
+                    drawingContext.lineWidth = lerp(obj.startLineWidth, obj.endLineWidth, easedProgress2);
+                    drawingContext.strokeStyle = `rgba(255, 255, 255, ${currentOpacity2})`;
+
+                    for (let j = 0; j < obj.numWaves; j++) {
+                        const waveProgress = Math.max(0, obj.progress * 1.2 - j * 0.2);
+                         if (waveProgress > 0 && waveProgress < 1) {
+                            const easedWaveProgress = easeOutQuad2(waveProgress);
+                            const currentRadius = lerp(obj.startRadius, obj.maxRadius, easedWaveProgress);
+                            drawRippleWave(drawingContext, obj, currentRadius);
+                        }
+                    }
+                    break;
+                 case 'sparkle':
+                    const age = performance.now() - obj.creationTime;
+                    const lifeProgress = age / obj.duration;
+
+                    // A sine wave from 0 to PI creates a nice "pulse" effect (in then out).
+                    const pulse = Math.sin(lifeProgress * Math.PI);
+                    
+                    const currentSize = obj.maxSize * pulse;
+                    const currentSparkleOpacity = pulse;
+
+                    if (currentSize > 0) {
+                        // Dynamically set the opacity based on the pulse.
+                        drawingContext.fillStyle = obj.color.replace(/, [0-9.]+\)/, `, ${currentSparkleOpacity})`);
+                        drawingContext.beginPath();
+                        drawingContext.arc(0, 0, currentSize, 0, Math.PI * 2);
+                        drawingContext.fill();
+                    }
+                    break;
+            }
+            drawingContext.restore();
+        }
+
+        requestAnimationFrame(animate);
+    }
+
+    // Start
+    resize();
+    startSimulation();
+
+  </script>
+</body>
+</html>
